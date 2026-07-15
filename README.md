@@ -39,4 +39,6 @@ The ABSA pipeline uses:
 
 The original aspect model reports approximately 86.2% accuracy on the SemEval restaurant test set.
 
+## Scheme
+
 ![system_scheme](assets/system_scheme.png)
