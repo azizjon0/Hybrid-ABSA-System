@@ -1,5 +1,5 @@
 # Hybrid ABSA System
-
+![Preview](assets/Preview.png)
 A hybrid Aspect-Based Sentiment Analysis pipeline for extracting
 business insights from customer reviews.
 
