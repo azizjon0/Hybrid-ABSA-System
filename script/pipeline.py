@@ -1,72 +1,138 @@
-import pandas as pd
+"""Hybrid ABSA inference pipeline.
+
+Expected project setup:
+- A Python module named ``model.py`` that exposes a trained ABSA object as ``model``.
+- Environment variable ``OPENAI_API_KEY`` when LLM fallback is enabled.
+
+Example:
+    export OPENAI_API_KEY="..."
+    python hybrid_absa_pipeline_fixed.py \
+        --input restaurant_reviews_30.csv \
+        --output hybrid_predictions.csv \
+        --model-module model \
+        --threshold 0.60
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
 import json
-from datetime import datetime
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
 from openai import OpenAI
 from tqdm.auto import tqdm
 
-# =========================
-# SETTINGS
-# =========================
+ALLOWED_POLARITIES = ("conflict", "negative", "neutral", "positive")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the hybrid ABSA pipeline")
+    parser.add_argument("--input", required=True, help="Input CSV containing a text column")
+    parser.add_argument("--output", default="hybrid_absa_predictions.csv")
+    parser.add_argument("--model-module", default="model", help="Module exposing a variable named model")
+    parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--llm-model", default="gpt-4.1-mini")
+    parser.add_argument("--disable-llm", action="store_true")
+    parser.add_argument("--checkpoint-every", type=int, default=10)
+    return parser.parse_args()
 
-CONFIDENCE_THRESHOLD = 0.60
-LLM_MODEL = "gpt-4.1-mini"
 
-DATA_PATH = "/kaggle/working/restaurant_reviews_30.csv"
-OUTPUT_PATH = "hybrid_absa_predictions_with_llm_corrected.csv"
-
-labels = ["conflict", "negative", "neutral", "positive"]
-
-# =========================
-# LOAD DATA
-# =========================
-
-df = pd.read_csv(DATA_PATH)
-df.columns = df.columns.str.strip()
-
-texts = df["text"].tolist()
-stars = df["stars"].tolist() if "stars" in df.columns else [None] * len(df)
-
-print(f"Loaded reviews: {len(df)}")
-print(f"Columns: {df.columns.tolist()}")
-print("=" * 100)
-
-# =========================
-# RUN ABSA MODEL
-# =========================
-
-print("Running ABSA model...")
-preds = model.predict(texts)
-print("ABSA predictions finished.")
-print("=" * 100)
-
-# =========================
-# LLM FUNCTION
-# =========================
-
-def safe_json_loads(raw):
+def load_absa_model(module_name: str) -> Any:
     try:
-        return json.loads(raw)
-    except Exception:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Could not import model module '{module_name}'. "
+            "Run the script from the project root or pass --model-module."
+        ) from exc
+
+    if not hasattr(module, "model"):
+        raise RuntimeError(f"Module '{module_name}' does not expose a variable named 'model'.")
+    return module.model
+
+
+def create_openai_client(disable_llm: bool) -> OpenAI | None:
+    if disable_llm:
+        return None
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Set it or run with --disable-llm."
+        )
+    return OpenAI(api_key=api_key)
+
+
+def safe_json_loads(raw: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
         try:
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            return json.loads(raw[start:end])
-        except Exception:
+            parsed = json.loads(raw[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
             return None
 
 
-def ask_llm_for_uncertain_aspects(text, stars, uncertain_aspects):
+def validate_llm_items(
+    parsed: dict[str, Any] | None,
+    expected_ids: set[int],
+) -> dict[int, dict[str, Any]]:
+    if not parsed or not isinstance(parsed.get("items"), list):
+        return {}
+
+    validated: dict[int, dict[str, Any]] = {}
+    for item in parsed["items"]:
+        if not isinstance(item, dict):
+            continue
+
+        item_id = item.get("item_id")
+        aspect = item.get("corrected_aspect")
+        polarity = item.get("corrected_polarity")
+
+        if not isinstance(item_id, int) or item_id not in expected_ids or item_id in validated:
+            continue
+        if not isinstance(aspect, str) or not aspect.strip():
+            continue
+        if polarity not in ALLOWED_POLARITIES:
+            continue
+
+        validated[item_id] = {
+            "item_id": item_id,
+            "corrected_aspect": aspect.strip(),
+            "corrected_polarity": polarity,
+            "change_needed": bool(item.get("change_needed", False)),
+            "reason": str(item.get("reason", "")).strip(),
+        }
+
+    return validated
+
+
+def ask_llm_for_uncertain_aspects(
+    client: OpenAI,
+    llm_model: str,
+    text: str,
+    stars: Any,
+    uncertain_aspects: list[dict[str, Any]],
+    max_attempts: int = 3,
+) -> tuple[dict[int, dict[str, Any]], str | None]:
     prompt = f"""
 You are an ABSA correction expert for restaurant reviews.
 
-Your job:
-Correct ONLY the uncertain ABSA predictions listed below.
-
-Do NOT create new aspects unless the given aspect is clearly wrong.
-Do NOT return multiple aspects in one field.
+Correct only the uncertain ABSA predictions below.
 Each input item must have exactly one output item with the same item_id.
+Do not return multiple aspects in one field.
 
 Review:
 {text}
@@ -74,307 +140,262 @@ Review:
 Stars:
 {stars}
 
-Uncertain ABSA predictions:
+Uncertain predictions:
 {json.dumps(uncertain_aspects, indent=2, ensure_ascii=False)}
 
-Return ONLY valid JSON in this exact format:
+Return only valid JSON:
 {{
   "items": [
     {{
       "item_id": 0,
-      "corrected_aspect": "single aspect here",
-      "corrected_polarity": "positive/negative/neutral/conflict",
+      "corrected_aspect": "single aspect",
+      "corrected_polarity": "positive",
       "change_needed": true,
       "reason": "short explanation"
     }}
   ]
 }}
 
-Rules:
-- polarity must be only one of: positive, negative, neutral, conflict
-- corrected_aspect must be one short aspect, not a list
-- if original aspect is acceptable, keep the same aspect
-- if original polarity is acceptable, keep the same polarity
-"""
+Allowed polarities: conflict, negative, neutral, positive.
+If the original aspect or polarity is acceptable, keep it unchanged.
+""".strip()
 
-    response = client.responses.create(
-        model=LLM_MODEL,
-        input=prompt
-    )
+    expected_ids = {int(item["item_id"]) for item in uncertain_aspects}
+    last_raw: str | None = None
 
-    raw = response.output_text
-    parsed = safe_json_loads(raw)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.responses.create(model=llm_model, input=prompt)
+            last_raw = response.output_text
+            validated = validate_llm_items(safe_json_loads(last_raw), expected_ids)
+            if set(validated) == expected_ids:
+                return validated, last_raw
+        except Exception as exc:
+            last_raw = f"LLM request failed: {type(exc).__name__}: {exc}"
 
-    return parsed, raw
+        if attempt < max_attempts:
+            time.sleep(2 ** (attempt - 1))
 
-# =========================
-# MAIN LOOP
-# =========================
+    return {}, last_raw
 
-rows = []
-total = len(texts)
 
-for review_idx, (text, pred) in enumerate(tqdm(zip(texts, preds), total=total)):
+def get_class_labels(model: Any, probability_count: int) -> list[str]:
+    """Prefer labels stored by the classifier; otherwise validate the fallback order."""
+    candidates = [
+        getattr(getattr(model, "polarity_model", None), "classes_", None),
+        getattr(getattr(getattr(model, "polarity_model", None), "model_head", None), "classes_", None),
+    ]
+    for candidate in candidates:
+        if candidate is not None:
+            labels = [str(value) for value in candidate]
+            if len(labels) == probability_count:
+                return labels
 
-    star = stars[review_idx]
-
-    print("\n" + "=" * 100)
-    print(f"REVIEW {review_idx + 1}/{total}")
-    print("-" * 100)
-    print(f"Text: {text[:300]}")
-    print(f"Stars: {star}")
-
-    review_predictions = []
-    uncertain_aspects = []
-
-    # =========================
-    # CASE: NO ABSA PREDICTION
-    # =========================
-
-    if len(pred) == 0:
-        print("No ABSA aspects found.")
-        print("Sending whole review to LLM as one uncertain item.")
-
-        uncertain_aspects = [{
-            "item_id": 0,
-            "aspect": "",
-            "polarity": "",
-            "confidence": 0.0,
-            "proba_conflict": None,
-            "proba_negative": None,
-            "proba_neutral": None,
-            "proba_positive": None
-        }]
-
-        parsed, raw = ask_llm_for_uncertain_aspects(
-            text=text,
-            stars=star,
-            uncertain_aspects=uncertain_aspects
+    if probability_count != len(ALLOWED_POLARITIES):
+        raise RuntimeError(
+            f"Expected {len(ALLOWED_POLARITIES)} polarity probabilities, got {probability_count}."
         )
+    return list(ALLOWED_POLARITIES)
 
-        llm_items = {}
 
-        if parsed and "items" in parsed:
-            llm_items = {item["item_id"]: item for item in parsed["items"]}
+def save_checkpoint(rows: list[dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    pd.DataFrame(rows).to_csv(temporary_path, index=False)
+    temporary_path.replace(output_path)
 
-        llm_item = llm_items.get(0, {})
 
-        rows.append({
-            "id": review_idx,
-            "text": text,
-            "stars": star,
+def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
+    if not 0 <= args.threshold <= 1:
+        raise ValueError("--threshold must be between 0 and 1")
 
-            "aspect": "",
-            "polarity": "",
-            "proba_predicted_label": "",
-            "confidence": 0.0,
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {input_path}")
 
-            "proba_conflict": None,
-            "proba_negative": None,
-            "proba_neutral": None,
-            "proba_positive": None,
+    df = pd.read_csv(input_path)
+    df.columns = df.columns.str.strip()
+    if "text" not in df.columns:
+        raise ValueError("Input CSV must contain a 'text' column")
 
-            "llm_called": True,
-            "llm_raw_response": raw,
+    df = df[df["text"].notna()].copy()
+    df["text"] = df["text"].astype(str)
+    texts = df["text"].tolist()
+    stars = df["stars"].tolist() if "stars" in df.columns else [None] * len(df)
 
-            "llm_aspect": llm_item.get("corrected_aspect"),
-            "llm_polarity": llm_item.get("corrected_polarity"),
-            "llm_change_needed": llm_item.get("change_needed"),
-            "llm_reason": llm_item.get("reason"),
+    model = load_absa_model(args.model_module)
+    client = create_openai_client(args.disable_llm)
 
-            "final_aspect": llm_item.get("corrected_aspect"),
-            "final_polarity": llm_item.get("corrected_polarity"),
+    print(f"Loaded {len(df)} reviews")
+    print("Running local ABSA model...")
+    predictions = model.predict(texts)
 
-            "human_checked": False,
-            "corrected_aspect": llm_item.get("corrected_aspect"),
-            "corrected_polarity": llm_item.get("corrected_polarity"),
-            "keep": 1,
-            "comment": "No ABSA prediction, sent to LLM",
+    rows: list[dict[str, Any]] = []
 
-            "threshold": CONFIDENCE_THRESHOLD,
-            "timestamp": datetime.now()
-        })
+    for review_idx, (text, prediction) in enumerate(
+        tqdm(zip(texts, predictions), total=len(texts), desc="Reviews")
+    ):
+        star = stars[review_idx]
+        local_predictions: list[dict[str, Any]] = []
+        uncertain: list[dict[str, Any]] = []
 
-        continue
-
-    # =========================
-    # GET PROBABILITIES
-    # =========================
-
-    inputs = [f"{item['span']} {text}" for item in pred]
-    probs = model.polarity_model.predict_proba(inputs)
-
-    for aspect_idx, (item, prob) in enumerate(zip(pred, probs)):
-
-        prob_list = prob.tolist()
-
-        confidence = max(prob_list)
-        predicted_label = labels[prob_list.index(confidence)]
-
-        absa_aspect = item["span"]
-        absa_polarity = item["polarity"]
-
-        one_pred = {
-            "local_item_id": aspect_idx,
-
-            "aspect": absa_aspect,
-            "polarity": absa_polarity,
-            "proba_predicted_label": predicted_label,
-            "confidence": confidence,
-
-            "proba_conflict": prob_list[0],
-            "proba_negative": prob_list[1],
-            "proba_neutral": prob_list[2],
-            "proba_positive": prob_list[3],
-        }
-
-        review_predictions.append(one_pred)
-
-        print("-" * 100)
-        print(f"Aspect {aspect_idx + 1}/{len(pred)}")
-        print(f"ABSA aspect: {absa_aspect}")
-        print(f"ABSA polarity: {absa_polarity}")
-        print(f"Confidence: {confidence:.4f}")
-
-        if confidence < CONFIDENCE_THRESHOLD:
-            print("LOW CONFIDENCE -> marked for LLM")
-            uncertain_aspects.append({
-                "item_id": aspect_idx,
-                "aspect": absa_aspect,
-                "polarity": absa_polarity,
-                "confidence": round(float(confidence), 4),
-                "proba_conflict": round(float(prob_list[0]), 4),
-                "proba_negative": round(float(prob_list[1]), 4),
-                "proba_neutral": round(float(prob_list[2]), 4),
-                "proba_positive": round(float(prob_list[3]), 4),
-            })
+        if not prediction:
+            if client is None:
+                rows.append(build_row(
+                    review_idx, text, star, "", "", "", 0.0, {}, False, None,
+                    None, None, None, None, "", "", args.threshold,
+                    "No local aspect; LLM disabled",
+                ))
+            else:
+                uncertain = [{"item_id": 0, "aspect": "review", "polarity": "neutral", "confidence": 0.0}]
+                llm_items, raw = ask_llm_for_uncertain_aspects(
+                    client, args.llm_model, text, star, uncertain
+                )
+                item = llm_items.get(0)
+                final_aspect = item["corrected_aspect"] if item else ""
+                final_polarity = item["corrected_polarity"] if item else ""
+                rows.append(build_row(
+                    review_idx, text, star, "", "", "", 0.0, {}, True, raw,
+                    final_aspect or None, final_polarity or None,
+                    item.get("change_needed") if item else None,
+                    item.get("reason") if item else None,
+                    final_aspect, final_polarity, args.threshold,
+                    "No local aspect; sent to LLM" if item else "No local aspect; LLM failed",
+                ))
         else:
-            print("HIGH CONFIDENCE -> ABSA accepted")
+            polarity_inputs = [f"{item['span']} {text}" for item in prediction]
+            probabilities = model.polarity_model.predict_proba(polarity_inputs)
 
-    # =========================
-    # ONE LLM CALL PER REVIEW
-    # =========================
+            for aspect_idx, (item, probability) in enumerate(zip(prediction, probabilities)):
+                prob_list = [float(value) for value in probability.tolist()]
+                class_labels = get_class_labels(model, len(prob_list))
+                confidence = max(prob_list)
+                predicted_label = class_labels[prob_list.index(confidence)]
+                probability_map = dict(zip(class_labels, prob_list))
 
-    llm_called_for_review = False
-    llm_raw_response = None
-    llm_items_by_id = {}
+                local = {
+                    "local_item_id": aspect_idx,
+                    "aspect": str(item["span"]),
+                    "polarity": str(item["polarity"]),
+                    "proba_predicted_label": predicted_label,
+                    "confidence": confidence,
+                    "probabilities": probability_map,
+                }
+                local_predictions.append(local)
 
-    if len(uncertain_aspects) > 0:
-        print(f"\nSending {len(uncertain_aspects)} uncertain aspects to LLM in ONE request...")
+                if confidence < args.threshold:
+                    uncertain.append({
+                        "item_id": aspect_idx,
+                        "aspect": local["aspect"],
+                        "polarity": local["polarity"],
+                        "confidence": round(confidence, 4),
+                        "probabilities": {k: round(v, 4) for k, v in probability_map.items()},
+                    })
 
-        parsed, raw = ask_llm_for_uncertain_aspects(
-            text=text,
-            stars=star,
-            uncertain_aspects=uncertain_aspects
-        )
+            llm_items: dict[int, dict[str, Any]] = {}
+            raw: str | None = None
+            if uncertain and client is not None:
+                llm_items, raw = ask_llm_for_uncertain_aspects(
+                    client, args.llm_model, text, star, uncertain
+                )
 
-        llm_called_for_review = True
-        llm_raw_response = raw
+            for local in local_predictions:
+                item = llm_items.get(local["local_item_id"])
+                final_aspect = item["corrected_aspect"] if item else local["aspect"]
+                final_polarity = item["corrected_polarity"] if item else local["polarity"]
+                probabilities = local["probabilities"]
 
-        if parsed and "items" in parsed:
-            llm_items_by_id = {
-                item.get("item_id"): item
-                for item in parsed["items"]
-            }
-            print("LLM answered successfully.")
-        else:
-            print("LLM JSON parsing failed. Using ABSA predictions.")
+                rows.append(build_row(
+                    review_idx,
+                    text,
+                    star,
+                    local["aspect"],
+                    local["polarity"],
+                    local["proba_predicted_label"],
+                    local["confidence"],
+                    probabilities,
+                    item is not None,
+                    raw if item is not None else None,
+                    item.get("corrected_aspect") if item else None,
+                    item.get("corrected_polarity") if item else None,
+                    item.get("change_needed") if item else None,
+                    item.get("reason") if item else None,
+                    final_aspect,
+                    final_polarity,
+                    args.threshold,
+                    "Low confidence; corrected by LLM" if item else (
+                        "Low confidence; LLM unavailable or invalid" if local["confidence"] < args.threshold else ""
+                    ),
+                ))
 
-    else:
-        print("\nNo uncertain aspects. No LLM call.")
+        if args.checkpoint_every > 0 and (review_idx + 1) % args.checkpoint_every == 0:
+            save_checkpoint(rows, output_path)
 
-    # =========================
-    # BUILD FINAL ROWS
-    # =========================
+    result = pd.DataFrame(rows)
+    save_checkpoint(rows, output_path)
+    return result
 
-    for one_pred in review_predictions:
 
-        aspect_idx = one_pred["local_item_id"]
+def build_row(
+    review_id: int,
+    text: str,
+    stars: Any,
+    aspect: str,
+    polarity: str,
+    predicted_label: str,
+    confidence: float,
+    probabilities: dict[str, float],
+    llm_called: bool,
+    llm_raw_response: str | None,
+    llm_aspect: str | None,
+    llm_polarity: str | None,
+    llm_change_needed: bool | None,
+    llm_reason: str | None,
+    final_aspect: str,
+    final_polarity: str,
+    threshold: float,
+    comment: str,
+) -> dict[str, Any]:
+    return {
+        "id": review_id,
+        "text": text,
+        "stars": stars,
+        "aspect": aspect,
+        "polarity": polarity,
+        "proba_predicted_label": predicted_label,
+        "confidence": confidence,
+        "proba_conflict": probabilities.get("conflict"),
+        "proba_negative": probabilities.get("negative"),
+        "proba_neutral": probabilities.get("neutral"),
+        "proba_positive": probabilities.get("positive"),
+        "llm_called": llm_called,
+        "llm_raw_response": llm_raw_response,
+        "llm_aspect": llm_aspect,
+        "llm_polarity": llm_polarity,
+        "llm_change_needed": llm_change_needed,
+        "llm_reason": llm_reason,
+        "final_aspect": final_aspect,
+        "final_polarity": final_polarity,
+        "review_status": "unreviewed",
+        "prediction_was_correct": None,
+        "corrected_aspect": final_aspect,
+        "corrected_polarity": final_polarity,
+        "usable_for_training": True,
+        "comment": comment,
+        "threshold": threshold,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
-        absa_aspect = one_pred["aspect"]
-        absa_polarity = one_pred["polarity"]
-        confidence = one_pred["confidence"]
 
-        llm_item = llm_items_by_id.get(aspect_idx)
+def main() -> None:
+    args = parse_args()
+    result = run_pipeline(args)
+    print("\nFinished")
+    print(f"Output rows: {len(result)}")
+    print(f"LLM-corrected rows: {int(result['llm_called'].sum()) if not result.empty else 0}")
+    print(f"Saved to: {args.output}")
 
-        if llm_item is not None:
-            llm_called = True
 
-            llm_aspect = llm_item.get("corrected_aspect", absa_aspect)
-            llm_polarity = llm_item.get("corrected_polarity", absa_polarity)
-            llm_change_needed = llm_item.get("change_needed")
-            llm_reason = llm_item.get("reason")
-
-            final_aspect = llm_aspect
-            final_polarity = llm_polarity
-
-            comment = "Low confidence, corrected by LLM"
-
-        else:
-            llm_called = False
-
-            llm_aspect = None
-            llm_polarity = None
-            llm_change_needed = None
-            llm_reason = None
-
-            final_aspect = absa_aspect
-            final_polarity = absa_polarity
-
-            comment = ""
-
-        rows.append({
-            "id": review_idx,
-            "text": text,
-            "stars": star,
-
-            "aspect": absa_aspect,
-            "polarity": absa_polarity,
-            "proba_predicted_label": one_pred["proba_predicted_label"],
-            "confidence": confidence,
-
-            "proba_conflict": one_pred["proba_conflict"],
-            "proba_negative": one_pred["proba_negative"],
-            "proba_neutral": one_pred["proba_neutral"],
-            "proba_positive": one_pred["proba_positive"],
-
-            "llm_called": llm_called,
-            "llm_raw_response": llm_raw_response if llm_called else None,
-
-            "llm_aspect": llm_aspect,
-            "llm_polarity": llm_polarity,
-            "llm_change_needed": llm_change_needed,
-            "llm_reason": llm_reason,
-
-            "final_aspect": final_aspect,
-            "final_polarity": final_polarity,
-
-            "human_checked": False,
-            "corrected_aspect": final_aspect,
-            "corrected_polarity": final_polarity,
-            "keep": 1,
-            "comment": comment,
-
-            "threshold": CONFIDENCE_THRESHOLD,
-            "timestamp": datetime.now()
-        })
-
-    print(f"Saved rows for review: {len(review_predictions)}")
-
-# =========================
-# SAVE RESULT
-# =========================
-
-result = pd.DataFrame(rows)
-result.to_csv(OUTPUT_PATH, index=False)
-
-print("\n" + "=" * 100)
-print("FINISHED")
-print("=" * 100)
-print(f"Reviews processed: {len(df)}")
-print(f"Total output rows: {len(result)}")
-print(f"Rows corrected by LLM: {result['llm_called'].sum()}")
-print(f"Rows ABSA only: {(result['llm_called'] == False).sum()}")
-print(f"Saved to: {OUTPUT_PATH}")
-
-display(result.head())
+if __name__ == "__main__":
+    main()
