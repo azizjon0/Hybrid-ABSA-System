@@ -117,6 +117,39 @@ with st.sidebar:
 
     indices = list(df.index[mask])
 
+    # Быстрый переход к комментарию по его номеру в исходном CSV.
+    # Нумерация для пользователя начинается с 1.
+    st.divider()
+    st.subheader("Jump to review")
+
+    with st.form("jump_to_review_form", clear_on_submit=False):
+        review_number = st.number_input(
+            "Review number",
+            min_value=1,
+            max_value=max(n_total, 1),
+            value=min(st.session_state.pos + 1, max(n_total, 1)),
+            step=1,
+            help="Enter the review number as it appears in the original CSV.",
+        )
+        jump_submitted = st.form_submit_button(
+            "Go to review",
+            use_container_width=True,
+        )
+
+    if jump_submitted:
+        target_position = int(review_number) - 1
+        target_idx = df.index[target_position]
+
+        if target_idx in indices:
+            st.session_state.pos = indices.index(target_idx)
+            st.session_state.correcting = False
+            st.rerun()
+        else:
+            st.warning(
+                "This review is hidden by the current filter. "
+                "Select 'All reviews' to open it."
+            )
+
     n_checked = int((df["human_checked"] == True).sum())
     n_false = int((df["human_checked"] == False).sum())
     st.progress(n_checked / n_total if n_total else 0)
